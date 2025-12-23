@@ -695,6 +695,7 @@ fn run_profiler(
         eprintln!("Lost {total_lost_events} events.");
     }
 
+    // TODO: The pid->processes map is cleared by this point, so markers aren't saved in the right threads.
     if let Some(ipc_server) = ipc_server {
         ipc_server.shutdown_and_aggregate(&mut converter);
     }
