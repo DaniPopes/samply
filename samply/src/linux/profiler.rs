@@ -14,6 +14,7 @@ use linux_perf_data::linux_perf_event_reader::{
 use nix::sys::wait::WaitStatus;
 use tokio::sync::oneshot;
 
+use super::ipc::IpcServerHandle;
 use super::perf_event::EventSource;
 use super::perf_group::{AttachMode, PerfGroup};
 use super::proc_maps;
@@ -546,6 +547,14 @@ fn run_profiler(
 ) -> Profile {
     // eprintln!("Running...");
 
+    let ipc_server = match IpcServerHandle::spawn() {
+        Ok(server) => Some(server),
+        Err(e) => {
+            log::warn!("Failed to create IPC server: {e}");
+            None
+        }
+    };
+
     let mut should_stop_profiling_once_perf_events_exhausted = false;
     let mut pending_lost_events = 0;
     let mut total_lost_events = 0;
@@ -684,6 +693,10 @@ fn run_profiler(
 
     if total_lost_events > 0 {
         eprintln!("Lost {total_lost_events} events.");
+    }
+
+    if let Some(ipc_server) = ipc_server {
+        ipc_server.shutdown_and_aggregate(&mut converter);
     }
 
     converter.finish()

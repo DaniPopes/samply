@@ -530,6 +530,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "doctest-file"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
+
+[[package]]
 name = "dump-table"
 version = "0.1.0"
 dependencies = [
@@ -1168,6 +1174,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf64c2edc8226891a71f127587a2861b132d2b942310843814d5001d99a1d307"
 dependencies = [
  "smallvec",
+]
+
+[[package]]
+name = "interprocess"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d941b405bd2322993887859a8ee6ac9134945a24ec5ec763a8a962fc64dfec2d"
+dependencies = [
+ "doctest-file",
+ "futures-core",
+ "libc",
+ "recvmsg",
+ "tokio",
+ "widestring",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1934,6 +1955,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f93e7e49bb0bf967717f7bd674458b3d6b0c5f48ec7e3038166026a69fc22223"
 
 [[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2231,6 +2258,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "indexmap",
+ "interprocess",
  "lazy_static",
  "libc",
  "linux-perf-data",
@@ -3100,6 +3128,12 @@ dependencies = [
  "tokio",
  "wholesym",
 ]
+
+[[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "winapi"

@@ -227,6 +227,13 @@ impl Profile {
         }
     }
 
+    pub fn processes(&self) -> &[Process] {
+        &self.processes
+    }
+    pub fn threads(&self) -> &[Thread] {
+        &self.threads
+    }
+
     /// Change the declared sampling interval.
     pub fn set_interval(&mut self, interval: SamplingInterval) {
         self.interval = interval;

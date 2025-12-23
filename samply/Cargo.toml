@@ -71,6 +71,7 @@ plist = "1.7.0"
 
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 
+interprocess = { version = "2", features = ["tokio"] }
 parking_lot = "0.12.2"
 num_cpus = "1.13.1"
 uname = "0.1.1"

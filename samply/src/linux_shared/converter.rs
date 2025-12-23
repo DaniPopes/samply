@@ -7,10 +7,10 @@ use byteorder::LittleEndian;
 use debugid::DebugId;
 use framehop::{ExplicitModuleSectionInfo, FrameAddress, Module, Unwinder};
 use fxprof_processed_profile::{
-    Category, CategoryColor, CategoryHandle, CpuDelta, FrameFlags, LibraryHandle, LibraryInfo,
-    Marker, MarkerField, MarkerTiming, PlatformSpecificReferenceTimestamp, Profile,
-    ReferenceTimestamp, SamplingInterval, Schema, StringHandle, SubcategoryHandle, SymbolTable,
-    ThreadHandle,
+    Category, CategoryColor, CategoryHandle, CpuDelta, DynamicSchemaMarker, FrameFlags,
+    LibraryHandle, LibraryInfo, Marker, MarkerField, MarkerHandle, MarkerTiming,
+    PlatformSpecificReferenceTimestamp, Profile, ReferenceTimestamp, SamplingInterval, Schema,
+    StringHandle, SubcategoryHandle, SymbolTable, ThreadHandle,
 };
 use linux_perf_data::linux_perf_event_reader::TaskWasPreempted;
 use linux_perf_data::simpleperf_dso_type::{DSO_DEX_FILE, DSO_KERNEL, DSO_KERNEL_MODULE};
@@ -67,7 +67,7 @@ where
     U: Unwinder<Module = Module<MmapRangeOrVec>> + Default,
 {
     cache: U::Cache,
-    profile: Profile,
+    pub profile: Profile,
     processes: Processes<U>,
     timestamp_converter: TimestampConverter,
     current_sample_time: u64,
@@ -1776,6 +1776,27 @@ where
             MarkerTiming::Instant(timestamp),
             MmapMarker(path),
         );
+    }
+
+    pub fn timestamp_converter(&self) -> &TimestampConverter {
+        &self.timestamp_converter
+    }
+
+    pub fn handle_for_string(&mut self, string: &str) -> StringHandle {
+        self.profile.handle_for_string(string)
+    }
+
+    pub fn add_marker<T: DynamicSchemaMarker>(
+        &mut self,
+        pid: i32,
+        tid: i32,
+        timing: MarkerTiming,
+        marker: T,
+    ) -> MarkerHandle {
+        let process = self.processes.get_by_pid(pid, &mut self.profile);
+        let thread = process.threads.get_thread_by_tid(tid, &mut self.profile);
+        self.profile
+            .add_marker(thread.profile_thread, timing, marker)
     }
 }
 

@@ -1,3 +1,4 @@
+mod ipc;
 mod perf_event;
 mod perf_group;
 mod proc_maps;
