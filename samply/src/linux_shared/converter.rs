@@ -353,7 +353,6 @@ where
             };
 
             let label_frame = self.profile.handle_for_frame_with_label(
-                thread_handle,
                 thread.thread_label,
                 CategoryHandle::OTHER,
                 FrameFlags::empty(),
@@ -369,7 +368,6 @@ where
             );
 
             let label_frame = self.profile.handle_for_frame_with_label(
-                cpus.combined_thread_handle(),
                 thread.thread_label,
                 CategoryHandle::OTHER,
                 FrameFlags::empty(),
@@ -944,7 +942,7 @@ where
             ContextSwitchRecord::Out { preempted, .. } => {
                 self.context_switch_handler
                     .handle_switch_out(timestamp, &mut thread.context_switch_data);
-                if let (Some(cpus), Some(cpu_index)) = (&mut self.cpus, Some(common.cpu.unwrap())) {
+                if let (Some(cpus), Some(cpu_index)) = (&mut self.cpus, common.cpu) {
                     let combined_thread = cpus.combined_thread_handle();
                     let cpu = cpus.get_mut(cpu_index as usize, &mut self.profile);
                     self.context_switch_handler
@@ -992,16 +990,10 @@ where
         } else {
             // New thread within the same process.
             // eprintln!("New thread: pid={}, old_tid={}, new_tid={}", e.pid, e.ptid, e.tid);
-            let parent_thread = parent_process
-                .threads
-                .get_thread_by_tid(e.ptid, &mut self.profile);
-            let parent_thread_name = parent_thread.name.clone();
-            parent_process.recycle_or_get_new_thread(
-                e.tid,
-                parent_thread_name,
-                start_time,
-                &mut self.profile,
-            );
+
+            // Don't use parent's name here - the thread will get its own name via
+            // a COMM event, and recycling happens there based on the actual name.
+            parent_process.recycle_or_get_new_thread(e.tid, None, start_time, &mut self.profile);
         }
     }
 

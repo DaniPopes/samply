@@ -58,11 +58,12 @@ use mach2::port::{
     mach_port_limits_t, mach_port_right_t, mach_port_t, MACH_PORT_NULL, MACH_PORT_QLIMIT_MAX,
     MACH_PORT_RIGHT_RECEIVE, MACH_PORT_RIGHT_SEND,
 };
-use mach2::task::{task_get_special_port, TASK_BOOTSTRAP_PORT};
+use mach2::task::task_get_special_port;
+use mach2::task_special_ports::TASK_BOOTSTRAP_PORT;
 use mach2::traps::mach_task_self;
 use mach2::vm::{mach_vm_allocate, mach_vm_deallocate, mach_vm_remap};
 use mach2::vm_inherit::VM_INHERIT_SHARE;
-use rand::{self, Rng};
+use rand::{self, RngExt};
 
 /// The size that we preallocate on the stack to receive messages. If the message is larger than
 /// this, we retry and spill to the heap.

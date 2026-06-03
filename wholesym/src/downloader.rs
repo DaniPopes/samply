@@ -1,13 +1,14 @@
 use std::io::Write;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::{AsyncRead, AsyncReadExt as _};
+use reqwest_middleware::ClientWithMiddleware;
+use reqwest_retry::policies::ExponentialBackoff;
+use reqwest_retry::RetryTransientMiddleware;
 
-use crate::download::response_to_uncompressed_stream_with_progress;
+use crate::download::{response_to_uncompressed_stream_with_progress, UncompressedStream};
 use crate::file_creation::{create_file_cleanly, CleanFileCreationError};
 use crate::{async_double_buffer, DownloadError};
 
@@ -28,6 +29,8 @@ pub trait DownloaderObserver: Send + Sync + 'static {
     fn on_download_started(&self, download_id: u64);
 
     /// Called frequently during the download, whenever a new chunk has been read.
+    /// May be called even after on_download_canceled because cancelling doesn't
+    /// work very well at the moment.
     ///
     /// If the HTTP response is gzip-compressed, the number of bytes can refer to
     /// either the compressed or the uncompressed bytes - but it'll be consistent:
@@ -176,7 +179,7 @@ impl ChunkConsumer for NoopChunkConsumer {
 }
 
 pub struct Downloader {
-    reqwest_client: Result<reqwest::Client, reqwest::Error>,
+    reqwest_client: Result<ClientWithMiddleware, reqwest::Error>,
 }
 
 impl Default for Downloader {
@@ -185,8 +188,42 @@ impl Default for Downloader {
     }
 }
 
+/// Install rustls's `ring` crypto provider as the process-wide default.
+///
+/// We use reqwest's `rustls-no-provider` feature, so a provider must be
+/// installed before building any `reqwest::Client`. `install_default` only
+/// succeeds for the first caller, but if some other code in the process
+/// already installed a provider that's fine — we just want one to exist.
+fn ensure_crypto_provider_installed() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl Downloader {
     pub fn new() -> Self {
+        Self::new_internal(5, None)
+    }
+
+    /// Create a `Downloader` with the given `User-Agent` header string and the default
+    /// retry policy (5 retries with exponential backoff).
+    pub fn new_with_user_agent(user_agent: &str) -> Self {
+        Self::new_internal(5, Some(user_agent))
+    }
+
+    /// Create a `Downloader` that retries transient failures (5xx, 429, connection
+    /// errors) up to `max_retries` additional times with exponential backoff.
+    /// Pass `0` to disable retries — useful in tests.
+    #[cfg(test)]
+    pub(crate) fn new_with_max_retries(max_retries: u32) -> Self {
+        Self::new_internal(max_retries, None)
+    }
+
+    fn new_internal(max_retries: u32, user_agent: Option<&str>) -> Self {
+        ensure_crypto_provider_installed();
+
         let builder = reqwest::Client::builder();
 
         // Turn off HTTP 2, in order to work around https://github.com/seanmonstar/reqwest/issues/1761 .
@@ -198,9 +235,18 @@ impl Downloader {
         // Instead, we do the streaming decompression manually, see download.rs.
         let builder = builder.no_gzip().no_brotli().no_deflate();
 
-        // Create the client.
-        // TODO: Add timeouts, user agent, maybe other settings
-        let reqwest_client = builder.build();
+        let builder = match user_agent {
+            Some(ua) => builder.user_agent(ua),
+            None => builder,
+        };
+
+        // TODO: Add timeouts
+        let reqwest_client = builder.build().map(|client| {
+            let retry_policy = ExponentialBackoff::builder().build_with_max_retries(max_retries);
+            reqwest_middleware::ClientBuilder::new(client)
+                .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+                .build()
+        });
 
         Self { reqwest_client }
     }
@@ -228,10 +274,18 @@ impl Downloader {
         let request_builder = request_builder.header("Accept-Encoding", "gzip");
 
         // Send the request and wait for the headers.
-        let response_result = request_builder.send().await;
-
-        // Check the HTTP status code.
-        let response_result = response_result.and_then(|response| response.error_for_status());
+        // The retry middleware handles transient failures (5xx, 429, connection errors)
+        // transparently before returning here.
+        let response_result: Result<reqwest::Response, reqwest::Error> =
+            match request_builder.send().await {
+                Ok(response) => response.error_for_status(),
+                Err(reqwest_middleware::Error::Reqwest(e)) => Err(e),
+                Err(reqwest_middleware::Error::Middleware(e)) => {
+                    let s = e.to_string();
+                    reporter.download_failed(DownloadError::Other(s.clone().into()));
+                    return Err(DownloadError::Other(s.into()));
+                }
+            };
 
         let response = match response_result {
             Ok(response) => response,
@@ -292,7 +346,7 @@ impl Downloader {
 
 pub struct PendingDownload {
     reporter: DownloadStatusReporter,
-    stream: Pin<Box<dyn AsyncRead + Send + Sync>>,
+    stream: UncompressedStream,
     observer: Option<Arc<dyn DownloaderObserver>>,
     ts_after_status: Instant,
 }
@@ -448,7 +502,7 @@ impl PendingDownload {
 }
 
 async fn consume_stream_and_write_to_file<C, O>(
-    mut stream: Pin<Box<dyn AsyncRead + Send + Sync>>,
+    mut stream: UncompressedStream,
     mut chunk_consumer: C,
     mut dest_file: std::fs::File,
 ) -> Result<(FileDownloadOutcome<O>, u64), DownloadError>
@@ -463,6 +517,9 @@ where
     // The producer calls stream.read(...).await. For compressed streams, this will
     // run the decompression. We want to run the chunk_consumer and the file writing
     // on a different thread, so we put that work into a consumer_task.
+    // Note: The producer task will keep reading from the stream even if the
+    // consume_stream_and_write_to_file future is cancelled! This is probably worth
+    // fixing at some point.
     let producer_task = async move {
         let mut uncompressed_size_in_bytes = 0;
         loop {
@@ -498,8 +555,8 @@ where
     };
 
     // Read the downloaded data from the buffers handed out by the producer.
-    // Doing this in a blocking tokio task allows the file writing and the
-    // chunk consumption to happen on different threads.
+    // Doing this in a blocking tokio task allows the decompression and the
+    // file writing / chunk consumption to happen on different threads.
     // Single-threaded profile: https://share.firefox.dev/46eUtwL
     // Multi-threaded profile: https://share.firefox.dev/3JP5zB0
     // This was when downloading https://symbols.mozilla.org/XUL/0165BCFB93BD3DC99DA5AC4F033C164B0/XUL.sym
@@ -540,4 +597,103 @@ where
         FileDownloadOutcome::DidCreateNewFile(chunk_consumer_output),
         uncompressed_size_in_bytes,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Use max_retries=0 in tests that expect errors so that retry backoff
+    // delays don't slow them down. Tests that expect success are unaffected
+    // since the first attempt succeeds immediately.
+
+    #[tokio::test]
+    async fn download_200_returns_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"abcde".as_ref()))
+            .mount(&server)
+            .await;
+
+        let downloader = Downloader::new_with_max_retries(0);
+        let pending = downloader
+            .initiate_download(&server.uri(), None)
+            .await
+            .unwrap();
+        let bytes = pending.download_to_memory().await.unwrap();
+        assert_eq!(bytes, b"abcde");
+    }
+
+    #[tokio::test]
+    async fn download_404_returns_status_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let downloader = Downloader::new_with_max_retries(0);
+        let result = downloader.initiate_download(&server.uri(), None).await;
+        assert!(matches!(result, Err(DownloadError::StatusError(404))));
+    }
+
+    #[tokio::test]
+    async fn download_500_returns_status_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let downloader = Downloader::new_with_max_retries(0);
+        let result = downloader.initiate_download(&server.uri(), None).await;
+        assert!(matches!(result, Err(DownloadError::StatusError(500))));
+    }
+
+    #[tokio::test]
+    async fn download_500_retried_then_succeeds() {
+        let server = MockServer::start().await;
+        // First two requests return 500; third returns 200.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".as_ref()))
+            .mount(&server)
+            .await;
+
+        // max_retries=2 means up to 3 total attempts — enough to get past the two 500s.
+        // Use a very short min backoff to keep the test fast.
+        let retry_policy = ExponentialBackoff::builder()
+            .retry_bounds(
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(10),
+            )
+            .build_with_max_retries(2);
+        ensure_crypto_provider_installed();
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .build()
+            .unwrap();
+        let middleware_client = reqwest_middleware::ClientBuilder::new(client)
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
+        let downloader = Downloader {
+            reqwest_client: Ok(middleware_client),
+        };
+
+        let pending = downloader
+            .initiate_download(&server.uri(), None)
+            .await
+            .unwrap();
+        let bytes = pending.download_to_memory().await.unwrap();
+        assert_eq!(bytes, b"ok");
+    }
 }

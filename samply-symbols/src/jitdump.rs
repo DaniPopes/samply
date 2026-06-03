@@ -20,7 +20,7 @@ use crate::shared::{
     LookupAddress, SymbolInfo,
 };
 use crate::symbol_map::{GetInnerSymbolMap, SymbolMap, SymbolMapTrait};
-use crate::{FileAndPathHelper, SourceFilePath, SourceFilePathHandle, SyncAddressInfo};
+use crate::{FileTypes, SourceFilePath, SourceFilePathHandle, SyncAddressInfo};
 use crate::{FunctionNameHandle, SymbolMapStringInterner, SymbolNameHandle};
 
 pub fn is_jitdump_file<T: FileContents>(file_contents: &FileContentsWrapper<T>) -> bool {
@@ -165,10 +165,10 @@ pub struct JitDumpIndexEntry {
     pub code_bytes_len: u64,
 }
 
-pub fn get_symbol_map_for_jitdump<H: FileAndPathHelper>(
-    file_contents: FileContentsWrapper<H::F>,
-    file_location: H::FL,
-) -> Result<SymbolMap<H>, Error> {
+pub fn get_symbol_map_for_jitdump<FT: FileTypes>(
+    file_contents: FileContentsWrapper<FT::F>,
+    file_location: FT::FL,
+) -> Result<SymbolMap<FT>, Error> {
     let outer = JitDumpSymbolMapOuter::new(file_contents)?;
     let symbol_map = JitDumpSymbolMap(Yoke::attach_to_cart(Box::new(outer), |outer| {
         outer.make_symbol_map()
@@ -305,6 +305,7 @@ impl<'a, T: FileContents> JitDumpSymbolMapInner<'a, T> {
         let lookup_avma = debug_info.code_addr + offset_relative_to_symbol;
         let entry = debug_info.lookup(lookup_avma)?;
         let line = entry.line;
+        let column = entry.column;
         let file_path = match entry.file_path.as_slice() {
             Cow::Borrowed(s) => cache.string_interner.intern_cow(String::from_utf8_lossy(s)),
             Cow::Owned(s) => cache
@@ -315,6 +316,8 @@ impl<'a, T: FileContents> JitDumpSymbolMapInner<'a, T> {
             function: Some(name.into()),
             file_path: Some(file_path.into()),
             line_number: Some(line),
+            column_number: Some(column),
+            ..Default::default()
         };
 
         let frames = Some(FramesLookupResult::Available(vec![frame]));
