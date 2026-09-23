@@ -43,15 +43,26 @@ pub enum StackFrame {
     ReturnAddress(u64, StackMode),
     AdjustedReturnAddress(u64, StackMode),
     TruncatedStackMarker,
+    FramePointerFallbackMarker,
 }
 
 impl StackFrame {
+    pub fn unwind_label(&self) -> Option<&'static str> {
+        match self {
+            Self::TruncatedStackMarker => Some("[stack truncated]"),
+            Self::FramePointerFallbackMarker => {
+                Some("[frame-pointer fallback; completeness unknown]")
+            }
+            _ => None,
+        }
+    }
+
     pub fn address(&self) -> u64 {
         match *self {
             StackFrame::InstructionPointer(addr, _) => addr,
             StackFrame::ReturnAddress(addr, _) => addr,
             StackFrame::AdjustedReturnAddress(addr, _) => addr,
-            StackFrame::TruncatedStackMarker => 0,
+            StackFrame::TruncatedStackMarker | StackFrame::FramePointerFallbackMarker => 0,
         }
     }
 
@@ -60,7 +71,7 @@ impl StackFrame {
             StackFrame::InstructionPointer(_, stack_mode) => Some(stack_mode),
             StackFrame::ReturnAddress(_, stack_mode) => Some(stack_mode),
             StackFrame::AdjustedReturnAddress(_, stack_mode) => Some(stack_mode),
-            StackFrame::TruncatedStackMarker => None,
+            StackFrame::TruncatedStackMarker | StackFrame::FramePointerFallbackMarker => None,
         }
     }
 

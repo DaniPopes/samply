@@ -21,7 +21,7 @@ use linux_perf_data::{
 use linux_perf_event_reader::constants::PERF_CONTEXT_MAX;
 use linux_perf_event_reader::{
     CommOrExecRecord, CommonData, ContextSwitchRecord, ForkOrExitRecord, Mmap2FileId, Mmap2Record,
-    MmapRecord, RawDataU64, SampleRecord,
+    MmapRecord, RawData, RawDataU64, SampleRecord,
 };
 use memmap2::Mmap;
 use object::{CompressedFileRange, CompressionFormat, Object, ObjectSection};
@@ -624,38 +624,21 @@ where
 
         // Get the first fragment of the stack from e.callchain.
         if let Some(callchain) = e.callchain {
-            let mut is_first_frame = true;
-            let mut mode = StackMode::from(e.cpu_mode);
-            for i in 0..callchain.len() {
-                let address = callchain.get(i).unwrap();
-                if address >= PERF_CONTEXT_MAX {
-                    if let Some(new_mode) = StackMode::from_context_frame(address) {
-                        mode = new_mode;
-                    }
-                    continue;
-                }
-
-                let stack_frame =
-                    match (is_first_frame, call_chain_return_addresses_are_preadjusted) {
-                        (true, _) => StackFrame::InstructionPointer(address, mode),
-                        (false, false) => StackFrame::ReturnAddress(address, mode),
-                        (false, true) => StackFrame::AdjustedReturnAddress(address, mode),
-                    };
-                stack.push_callchain(stack_frame);
-
-                is_first_frame = false;
-            }
+            stack.set_callchain(
+                callchain,
+                e.cpu_mode.into(),
+                call_chain_return_addresses_are_preadjusted,
+            );
         }
 
         // Append the user stack with the help of DWARF unwinding.
-        if let (Some(regs), Some((user_stack, _))) = (&e.user_regs, e.user_stack) {
-            let ustack_bytes = RawDataU64::from_raw_data::<LittleEndian>(user_stack);
+        if let (Some(regs), Some((user_stack, captured_len))) = (&e.user_regs, e.user_stack) {
             let (pc, sp, regs) = C::convert_regs(regs);
+            let mut failed_read = None;
             let mut read_stack = |addr: u64| {
-                // ustack_bytes has the stack bytes starting from the current stack pointer.
-                let offset = addr.checked_sub(sp).ok_or(())?;
-                let index = usize::try_from(offset / 8).map_err(|_| ())?;
-                ustack_bytes.get(index).ok_or(())
+                read_stack_word(user_stack, captured_len, sp, addr).inspect_err(|_| {
+                    failed_read = Some(addr);
+                })
             };
 
             // Unwind.
@@ -664,7 +647,8 @@ where
                 let frame = match frames.next() {
                     Ok(Some(frame)) => frame,
                     Ok(None) => break,
-                    Err(_) => {
+                    Err(error) => {
+                        log::debug!("Unwind failed: {error:?}; sp={sp:#x}; captured_bytes={captured_len}; failed_read={failed_read:?}");
                         stack.push_dwarf(StackFrame::TruncatedStackMarker);
                         break;
                     }
@@ -2067,8 +2051,27 @@ struct SampleStack {
 }
 
 impl SampleStack {
-    fn push_callchain(&mut self, frame: StackFrame) {
-        self.callchain.push(frame);
+    fn set_callchain(&mut self, callchain: RawDataU64<'_>, mut mode: StackMode, preadjusted: bool) {
+        let mut is_first_frame = true;
+        for i in 0..callchain.len() {
+            let address = callchain.get(i).unwrap();
+            if address >= PERF_CONTEXT_MAX {
+                if let Some(new_mode) = StackMode::from_context_frame(address) {
+                    mode = new_mode;
+                    is_first_frame = true;
+                }
+                continue;
+            }
+
+            let stack_frame = match (is_first_frame, preadjusted) {
+                (true, _) => StackFrame::InstructionPointer(address, mode),
+                (false, false) => StackFrame::ReturnAddress(address, mode),
+                (false, true) => StackFrame::AdjustedReturnAddress(address, mode),
+            };
+            self.callchain.push(stack_frame);
+
+            is_first_frame = false;
+        }
     }
 
     fn push_dwarf(&mut self, frame: StackFrame) {
@@ -2094,30 +2097,29 @@ impl SampleStack {
         // DWARF never has kernel frames, since it's extracted from user stack.
         debug_assert!(self.dwarf.iter().all(|f| !f.is_kernel()));
 
-        // Check if DWARF unwinding was truncated.
-        let dwarf_truncated = self
-            .dwarf
-            .last()
-            .is_some_and(|f| matches!(f, StackFrame::TruncatedStackMarker));
-
-        if dwarf_truncated && fp_stack.len() > 1 {
-            // DWARF unwinding failed partway through. Use DWARF frames (minus the
-            // truncation marker), then append the deeper FP frames that DWARF missed.
-            let dwarf_len = self.dwarf.len() - 1;
-            self.merged.extend_from_slice(&self.dwarf[..dwarf_len]);
-
-            // Find where to splice: match the last real DWARF frame's address in the
-            // FP callchain, then append everything deeper from the FP walk.
-            let last_dwarf_addr = self.dwarf[..dwarf_len].last().map(|f| f.address());
-            let splice_idx = last_dwarf_addr
-                .and_then(|addr| fp_stack.iter().position(|f| f.address() == addr))
-                .map(|i| i + 1)
-                .unwrap_or(fp_stack.len());
-            if splice_idx < fp_stack.len() {
-                self.merged.extend_from_slice(&fp_stack[splice_idx..]);
-            }
-        } else {
+        let Some((StackFrame::TruncatedStackMarker, dwarf_frames)) = self.dwarf.split_last() else {
             self.merged.extend_from_slice(&self.dwarf);
+            return;
+        };
+        self.merged.extend_from_slice(dwarf_frames);
+
+        // Require agreement from the sampled instruction through every recovered caller.
+        // Matching only the final address can splice at the wrong recursion depth. A
+        // disagreement may also mean a missing FP frame; do not invent an overlap there.
+        if !dwarf_frames.is_empty()
+            && fp_stack.len() > dwarf_frames.len()
+            && dwarf_frames
+                .iter()
+                .zip(fp_stack)
+                .all(|(dwarf, fp)| same_stack_frame(*dwarf, *fp))
+        {
+            self.merged
+                .extend_from_slice(&fp_stack[dwarf_frames.len()..]);
+            // NOTE: Perf callchains do not report why the FP walk stopped. Even an
+            // agreed continuation can hit a depth limit or a broken frame chain.
+            self.merged.push(StackFrame::FramePointerFallbackMarker);
+        } else {
+            self.merged.push(StackFrame::TruncatedStackMarker);
         }
     }
 
@@ -2135,5 +2137,232 @@ impl SampleStack {
 
     fn used_dwarf(&self) -> bool {
         !self.dwarf.is_empty()
+    }
+}
+
+/// Compare frame kind, address space, and lookup address, including simpleperf's
+/// preadjusted return addresses. An instruction pointer is not a return address.
+fn same_stack_frame(left: StackFrame, right: StackFrame) -> bool {
+    let key = |frame| match frame {
+        StackFrame::InstructionPointer(addr, mode) => Some((addr, mode, true)),
+        StackFrame::ReturnAddress(addr, mode) => Some((addr.saturating_sub(1), mode, false)),
+        StackFrame::AdjustedReturnAddress(addr, mode) => Some((addr, mode, false)),
+        StackFrame::TruncatedStackMarker | StackFrame::FramePointerFallbackMarker => None,
+    };
+    key(left).is_some_and(|left| Some(left) == key(right))
+}
+
+/// Read only bytes that perf actually copied, without rounding unaligned addresses down.
+fn read_stack_word(
+    mut stack: RawData<'_>,
+    captured_len: u64,
+    sp: u64,
+    addr: u64,
+) -> Result<u64, ()> {
+    let offset = addr.checked_sub(sp).ok_or(())?;
+    if offset.checked_add(8).ok_or(())? > captured_len {
+        return Err(());
+    }
+    stack
+        .skip(usize::try_from(offset).map_err(|_| ())?)
+        .map_err(|_| ())?;
+    stack.read_u64::<LittleEndian>().map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(addr: u64) -> StackFrame {
+        StackFrame::InstructionPointer(addr, StackMode::User)
+    }
+
+    fn ra(addr: u64) -> StackFrame {
+        StackFrame::ReturnAddress(addr, StackMode::User)
+    }
+
+    fn merged(callchain: &[StackFrame], dwarf: &[StackFrame]) -> Vec<StackFrame> {
+        let mut stack = SampleStack {
+            callchain: callchain.to_vec(),
+            dwarf: dwarf.to_vec(),
+            ..Default::default()
+        };
+        stack.merge();
+        stack.get().clone()
+    }
+
+    #[test]
+    fn merge_recursive_frames_at_the_matching_depth() {
+        let dwarf = [
+            ip(10),
+            ra(20),
+            ra(30),
+            ra(30),
+            StackFrame::TruncatedStackMarker,
+        ];
+        let fp = [ip(10), ra(20), ra(30), ra(30), ra(30), ra(40)];
+        let mut expected = fp.to_vec();
+        expected.push(StackFrame::FramePointerFallbackMarker);
+        assert_eq!(merged(&fp, &dwarf), expected);
+    }
+
+    #[test]
+    fn merge_rejects_accidental_and_missing_frame_overlaps() {
+        let dwarf = [ip(10), ra(20), ra(30), StackFrame::TruncatedStackMarker];
+        for fp in [
+            vec![ip(10), ra(99), ra(30), ra(40)],
+            vec![ip(10), ra(30), ra(40)],
+            vec![ip(11), ra(20), ra(30), ra(40)],
+            vec![ip(10), ra(20)],
+            vec![ip(10), ra(20), ra(30)],
+            vec![ip(10)],
+            vec![],
+        ] {
+            assert_eq!(merged(&fp, &dwarf), dwarf, "callchain: {fp:?}");
+        }
+    }
+
+    #[test]
+    fn merge_preserves_complete_dwarf_and_single_source_stacks() {
+        let fp = [ip(10), ra(99), ra(100)];
+        let dwarf = [ip(10), ra(20)];
+        assert_eq!(merged(&fp, &dwarf), dwarf);
+        assert_eq!(merged(&fp, &[]), fp);
+        assert_eq!(merged(&[], &dwarf), dwarf);
+        assert_eq!(merged(&[], &[]), []);
+        assert_eq!(
+            merged(&fp, &[StackFrame::TruncatedStackMarker]),
+            [StackFrame::TruncatedStackMarker]
+        );
+    }
+
+    #[test]
+    fn merge_keeps_kernel_frames_separate() {
+        let kernel = StackFrame::InstructionPointer(100, StackMode::Kernel);
+        let dwarf = [ip(10), ra(20), StackFrame::TruncatedStackMarker];
+        assert_eq!(
+            merged(&[kernel, ip(10), ra(20), ra(30)], &dwarf),
+            [
+                kernel,
+                ip(10),
+                ra(20),
+                ra(30),
+                StackFrame::FramePointerFallbackMarker
+            ],
+        );
+        assert_eq!(
+            merged(&[kernel], &dwarf),
+            [kernel, ip(10), ra(20), StackFrame::TruncatedStackMarker]
+        );
+    }
+
+    #[test]
+    fn merge_normalizes_preadjusted_return_addresses() {
+        let adjusted = StackFrame::AdjustedReturnAddress(19, StackMode::User);
+        let dwarf = [ip(10), ra(20), StackFrame::TruncatedStackMarker];
+        assert_eq!(
+            merged(&[ip(10), adjusted, ra(30)], &dwarf),
+            [
+                ip(10),
+                ra(20),
+                ra(30),
+                StackFrame::FramePointerFallbackMarker
+            ]
+        );
+        assert!(!same_stack_frame(ip(20), ra(20)));
+        assert!(!same_stack_frame(
+            ra(20),
+            StackFrame::ReturnAddress(20, StackMode::Kernel)
+        ));
+        assert!(!same_stack_frame(
+            StackFrame::TruncatedStackMarker,
+            StackFrame::TruncatedStackMarker
+        ));
+    }
+
+    #[test]
+    fn callchain_context_starts_with_an_instruction_pointer() {
+        let addresses = [
+            linux_perf_event_reader::constants::PERF_CONTEXT_KERNEL,
+            100,
+            200,
+            linux_perf_event_reader::constants::PERF_CONTEXT_USER,
+            10,
+            20,
+        ];
+        let bytes = addresses
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect::<Vec<_>>();
+        for preadjusted in [false, true] {
+            let mut stack = SampleStack::default();
+            stack.set_callchain(
+                RawDataU64::from_raw_data::<LittleEndian>(RawData::Single(&bytes)),
+                StackMode::Kernel,
+                preadjusted,
+            );
+            let return_address = if preadjusted {
+                StackFrame::AdjustedReturnAddress
+            } else {
+                StackFrame::ReturnAddress
+            };
+            assert_eq!(
+                stack.callchain,
+                [
+                    StackFrame::InstructionPointer(100, StackMode::Kernel),
+                    return_address(200, StackMode::Kernel),
+                    ip(10),
+                    return_address(20, StackMode::User),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn stack_reads_respect_dynamic_size_and_unaligned_addresses() {
+        let bytes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        for data in [
+            RawData::Single(&bytes),
+            RawData::Split(&bytes[..5], &bytes[5..]),
+        ] {
+            assert_eq!(
+                read_stack_word(data, 16, 100, 100),
+                Ok(u64::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7]))
+            );
+            assert_eq!(
+                read_stack_word(data, 16, 100, 101),
+                Ok(u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8]))
+            );
+            assert_eq!(
+                read_stack_word(data, 16, 100, 108),
+                Ok(u64::from_le_bytes([8, 9, 10, 11, 12, 13, 14, 15]))
+            );
+            for (length, address) in [
+                (0, 100),
+                (7, 100),
+                (8, 101),
+                (16, 99),
+                (16, 109),
+                (64, 116),
+                (u64::MAX, u64::MAX),
+            ] {
+                assert_eq!(read_stack_word(data, length, 100, address), Err(()));
+            }
+            assert_eq!(read_stack_word(data, u64::MAX, 0, u64::MAX), Err(()));
+        }
+    }
+
+    #[test]
+    fn clear_drops_all_previous_sample_state() {
+        let mut stack = SampleStack {
+            callchain: vec![ip(10), ra(20)],
+            dwarf: vec![ip(10), StackFrame::TruncatedStackMarker],
+            ..Default::default()
+        };
+        stack.merge();
+        stack.clear();
+        stack.push_dwarf(ip(30));
+        stack.merge();
+        assert_eq!(stack.get(), &[ip(30)]);
     }
 }
