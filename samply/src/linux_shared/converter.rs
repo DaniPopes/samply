@@ -9,8 +9,8 @@ use framehop::{ExplicitModuleSectionInfo, FrameAddress, Module, Unwinder};
 use fxprof_processed_profile::{
     Category, CategoryColor, CategoryHandle, CpuDelta, FrameFlags, LibraryHandle, LibraryInfo,
     Marker, MarkerField, MarkerTiming, PlatformSpecificReferenceTimestamp, Profile,
-    ReferenceTimestamp, SamplingInterval, Schema, StringHandle, SubcategoryHandle, SymbolTable,
-    ThreadHandle,
+    ReferenceTimestamp, SamplingInterval, Schema, SourceLocation, StringHandle, SubcategoryHandle,
+    SymbolTable, ThreadHandle,
 };
 use linux_perf_data::linux_perf_event_reader::TaskWasPreempted;
 use linux_perf_data::simpleperf_dso_type::{DSO_DEX_FILE, DSO_KERNEL, DSO_KERNEL_MODULE};
@@ -227,9 +227,6 @@ where
 
     pub fn finish(mut self) -> Profile {
         let mut profile = self.profile;
-        self.simpleperf
-            .jit_app_cache_library
-            .finish_and_set_symbol_table(&mut profile);
         self.processes.finish(
             &mut profile,
             &self.unresolved_stacks,
@@ -355,7 +352,6 @@ where
             };
 
             let label_frame = self.profile.handle_for_frame_with_label(
-                thread_handle,
                 thread.thread_label,
                 CategoryHandle::OTHER,
                 FrameFlags::empty(),
@@ -371,7 +367,6 @@ where
             );
 
             let label_frame = self.profile.handle_for_frame_with_label(
-                cpus.combined_thread_handle(),
                 thread.thread_label,
                 CategoryHandle::OTHER,
                 FrameFlags::empty(),
@@ -1365,11 +1360,14 @@ where
 
         let process = self.processes.get_by_pid(e.pid, &mut self.profile);
         let synthetic_lib = &mut self.simpleperf.jit_app_cache_library;
+        let symbol =
+            synthetic_lib.add_function(&name, len, SourceLocation::default(), &mut self.profile);
         let info = LibMappingInfo::new_java_mapping(
-            synthetic_lib.lib_handle(),
+            symbol.lib_handle,
             Some(synthetic_lib.default_category()),
-        );
-        process.add_jit_function(timestamp_raw, synthetic_lib, name, address, len, info);
+        )
+        .with_jit_symbol(symbol);
+        process.add_jit_function(timestamp_raw, symbol.symbol_address, address, len, info);
     }
 
     fn get_simpleperf_jit_function_name(

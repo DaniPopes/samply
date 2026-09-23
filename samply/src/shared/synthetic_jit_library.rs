@@ -80,10 +80,6 @@ impl SyntheticJitLibrary {
         relative_address
     }
 
-    pub fn lib_handle(&self) -> LibraryHandle {
-        self.lib_handle
-    }
-
     pub fn default_category(&self) -> SubcategoryHandle {
         self.default_category
     }
