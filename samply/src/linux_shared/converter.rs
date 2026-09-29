@@ -2115,9 +2115,6 @@ impl SampleStack {
         {
             self.merged
                 .extend_from_slice(&fp_stack[dwarf_frames.len()..]);
-            // NOTE: Perf callchains do not report why the FP walk stopped. Even an
-            // agreed continuation can hit a depth limit or a broken frame chain.
-            self.merged.push(StackFrame::FramePointerFallbackMarker);
         } else {
             self.merged.push(StackFrame::TruncatedStackMarker);
         }
@@ -2147,7 +2144,7 @@ fn same_stack_frame(left: StackFrame, right: StackFrame) -> bool {
         StackFrame::InstructionPointer(addr, mode) => Some((addr, mode, true)),
         StackFrame::ReturnAddress(addr, mode) => Some((addr.saturating_sub(1), mode, false)),
         StackFrame::AdjustedReturnAddress(addr, mode) => Some((addr, mode, false)),
-        StackFrame::TruncatedStackMarker | StackFrame::FramePointerFallbackMarker => None,
+        StackFrame::TruncatedStackMarker => None,
     };
     key(left).is_some_and(|left| Some(left) == key(right))
 }
@@ -2201,9 +2198,7 @@ mod tests {
             StackFrame::TruncatedStackMarker,
         ];
         let fp = [ip(10), ra(20), ra(30), ra(30), ra(30), ra(40)];
-        let mut expected = fp.to_vec();
-        expected.push(StackFrame::FramePointerFallbackMarker);
-        assert_eq!(merged(&fp, &dwarf), expected);
+        assert_eq!(merged(&fp, &dwarf), fp);
     }
 
     #[test]
@@ -2242,13 +2237,7 @@ mod tests {
         let dwarf = [ip(10), ra(20), StackFrame::TruncatedStackMarker];
         assert_eq!(
             merged(&[kernel, ip(10), ra(20), ra(30)], &dwarf),
-            [
-                kernel,
-                ip(10),
-                ra(20),
-                ra(30),
-                StackFrame::FramePointerFallbackMarker
-            ],
+            [kernel, ip(10), ra(20), ra(30)],
         );
         assert_eq!(
             merged(&[kernel], &dwarf),
@@ -2262,12 +2251,7 @@ mod tests {
         let dwarf = [ip(10), ra(20), StackFrame::TruncatedStackMarker];
         assert_eq!(
             merged(&[ip(10), adjusted, ra(30)], &dwarf),
-            [
-                ip(10),
-                ra(20),
-                ra(30),
-                StackFrame::FramePointerFallbackMarker
-            ]
+            [ip(10), ra(20), ra(30)]
         );
         assert!(!same_stack_frame(ip(20), ra(20)));
         assert!(!same_stack_frame(

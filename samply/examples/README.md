@@ -38,6 +38,5 @@ with `panic=abort`. Keep the matching executables when saving profiles.
 The merge accepts a continuation only when the FP and DWARF sequences agree
 from the sampled instruction through the last DWARF caller. An address match
 at one recursion level does not establish a valid join. Disagreement retains
-the DWARF fragment and its truncation label. Accepted FP continuations carry
-an explicit completeness-unknown label because perf does not report why its
-FP walk ended.
+the DWARF fragment. Perf does not report why its FP walk ended, so an agreed
+continuation may still be incomplete.

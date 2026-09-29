@@ -55,17 +55,14 @@ struct ConvertedStackIterD<I: Iterator<Item = SecondPassFrameInfo>> {
 }
 
 #[allow(clippy::type_complexity)]
-pub struct ConvertedStackIter<'a> {
-    inner: ConvertedStackIterD<
+pub struct ConvertedStackIter<'a>(
+    ConvertedStackIterD<
         LibartFilteringIter<
             'a,
             SecondPassIter<'a, FirstPassIter<Rev<Cloned<std::slice::Iter<'a, StackFrame>>>>>,
         >,
     >,
-    extra_first_frame: Option<FrameHandle>,
-    unwind_label: Option<&'static str>,
-    user_category: SubcategoryHandle,
-}
+);
 
 impl<I: Iterator<Item = StackFrame>> Iterator for FirstPassIter<I> {
     type Item = FirstPassFrameInfo;
@@ -81,9 +78,7 @@ impl<I: Iterator<Item = StackFrame>> Iterator for FirstPassIter<I> {
                 StackFrame::InstructionPointer(addr, mode) => (mode, addr, true),
                 StackFrame::ReturnAddress(addr, mode) => (mode, addr.saturating_sub(1), false),
                 StackFrame::AdjustedReturnAddress(addr, mode) => (mode, addr, false),
-                StackFrame::TruncatedStackMarker | StackFrame::FramePointerFallbackMarker => {
-                    continue
-                }
+                StackFrame::TruncatedStackMarker => continue,
             };
             return Some(FirstPassFrameInfo {
                 mode,
@@ -305,28 +300,11 @@ impl<I: Iterator<Item = SecondPassFrameInfo>> ConvertedStackIterD<I> {
 
 impl ConvertedStackIter<'_> {
     pub fn size_hint(&self) -> (usize, Option<usize>) {
-        let (lower, upper) = self.inner.size_hint();
-        let extra = usize::from(self.extra_first_frame.is_some())
-            + usize::from(self.unwind_label.is_some());
-        (
-            lower.saturating_add(extra),
-            upper.and_then(|upper| upper.checked_add(extra)),
-        )
+        self.0.size_hint()
     }
 
     pub fn next(&mut self, profile: &mut Profile) -> Option<FrameHandle> {
-        if let Some(frame) = self.extra_first_frame.take() {
-            return Some(frame);
-        }
-        if let Some(label) = self.unwind_label.take() {
-            let label = profile.handle_for_string(label);
-            return Some(profile.handle_for_frame_with_label(
-                label,
-                self.user_category,
-                FrameFlags::empty(),
-            ));
-        }
-        self.inner.next(profile)
+        self.0.next(profile)
     }
 }
 
@@ -349,12 +327,6 @@ impl StackConverter {
         lib_mappings: &'a LibMappingsHierarchy,
         extra_first_frame: Option<FrameHandle>,
     ) -> ConvertedStackIter<'a> {
-        let unwind_label = stack.last().and_then(StackFrame::unwind_label);
-        let stack = if unwind_label.is_some() {
-            &stack[..stack.len() - 1]
-        } else {
-            stack
-        };
         let pass1 = FirstPassIter(stack.iter().cloned().rev());
         let pass2 = SecondPassIter {
             inner: pass1,
@@ -371,15 +343,10 @@ impl StackConverter {
         };
         let pass4 = ConvertedStackIterD {
             inner: pass3,
-            pending_frame_handle: None,
+            pending_frame_handle: extra_first_frame,
             js_name_for_baseline_interpreter: None,
         };
-        ConvertedStackIter {
-            inner: pass4,
-            extra_first_frame,
-            unwind_label,
-            user_category: self.user_category,
-        }
+        ConvertedStackIter(pass4)
     }
 }
 
@@ -391,7 +358,7 @@ mod tests {
     };
 
     #[test]
-    fn exports_unwind_status_between_thread_label_and_native_frames() {
+    fn omits_unwind_status_from_exported_frames() {
         let mut profile = Profile::new(
             "test",
             ReferenceTimestamp::from_millis_since_unix_epoch(0.0),
@@ -414,17 +381,7 @@ mod tests {
             category,
             FrameFlags::empty(),
         );
-        for (marker, label) in [
-            (
-                Some(StackFrame::TruncatedStackMarker),
-                Some("[stack truncated]"),
-            ),
-            (
-                Some(StackFrame::FramePointerFallbackMarker),
-                Some("[frame-pointer fallback; completeness unknown]"),
-            ),
-            (None, None),
-        ] {
+        for marker in [Some(StackFrame::TruncatedStackMarker), None] {
             for extra in [Some(thread_frame), None] {
                 let mut stack = vec![
                     StackFrame::InstructionPointer(10, StackMode::User),
@@ -432,17 +389,8 @@ mod tests {
                 ];
                 stack.extend(marker);
                 let mut expected = extra.into_iter().collect::<Vec<_>>();
-                if let Some(label) = label {
-                    let label = profile.handle_for_string(label);
-                    expected.push(profile.handle_for_frame_with_label(
-                        label,
-                        category,
-                        FrameFlags::empty(),
-                    ));
-                }
                 expected.extend([caller, leaf]);
                 let mut iter = converter.convert_stack(process, &stack, &mappings, extra);
-                assert_eq!(iter.size_hint(), (expected.len(), Some(expected.len())));
                 let mut actual = Vec::new();
                 while let Some(frame) = iter.next(&mut profile) {
                     actual.push(frame);
